@@ -21,6 +21,8 @@ less_locking=1
 backup_triggers=1
 backup_events=1
 backup_routines=1
+retries=2
+fail_margin=3
 
 version="1.3.1"
 
@@ -47,6 +49,7 @@ export AUTOMYDUMPER_BACKUP_DIR="${backup_dir}"
 # Set preliminary successful exitcode
 export AUTOMYDUMPER_EXIT_CODE=0
 export AUTOMYDUMPER_EXIT_MESSAGE=
+export AUTOMYDUMPER_EXIT_AMOUNT_FAILED=0
 
 mydumper_opts="${mydumper_opts} -o ${backup_dir} -v 3 --threads ${threads}"
 
@@ -139,6 +142,8 @@ function handle_error()
 {
     export AUTOMYDUMPER_EXIT_CODE=1
     export AUTOMYDUMPER_EXIT_MESSAGE="${1}"
+    export AUTOMYDUMPER_EXIT_AMOUNT_FAILED="${amount_failed}"
+
 }
 
 function run_commands()
@@ -211,8 +216,57 @@ function run_mydumper()
     if mydumper ${mydumper_opts}; then
         symlink_latest
     else
-        handle_error "Mydumper could not complete backup"
+        if [ "$retries" -gt 0 ]; then
+            run_retry
+            amount_failed="$(cat ${backup_dir}/automydumper.log |grep CRIT |grep -oP '(?<=read data from )[^.]*' |sort|uniq|wc -l)"
+            if [ ${amount_failed} -gt ${fail_margin} ]; then
+                handle_error "Mydumper could not complete backup"
+            else
+                symlink_latest
+            fi
+        else
+            handle_error "Mydumper could not complete backup"
+        fi
     fi
+}
+
+function check_failed()
+{
+        failed="$(cat ${backup_dir}/automydumper.log |grep CRIT |grep -oP '(?<=read data from )[^.]*' |sort|uniq)"
+        for i in $failed; do
+            run_mydumper_on_failed  ${i}
+        done
+}
+
+function run_mydumper_on_failed(){
+
+    [ ${AUTOMYDUMPER_EXIT_CODE} -gt 0 ] && return
+
+    find find "${backup_dir}" -name "*${i}*" -delete
+    sed  "/${i}/d" ${backup_dir}/automydumper.log 
+    mydumper_opts="${mydumper_opts} --database ${i} "
+    if mydumper ${mydumper_opts} ; then
+        tryagain=0
+        return
+    else
+        tryagain=1
+    fi
+}
+
+function run_retry()
+{
+    [ ${AUTOMYDUMPER_EXIT_CODE} -gt 0 ] && return
+
+    retries_left=${retries}
+    while [ ${retries_left} -gt 0 ]; do
+        echo "Note: Retrying backup, ${retries_left} retries left."
+        check_failed
+        if [ ${tryagain:-0} -eq 0 ]; then
+            break
+        else
+            retries_left=$((retries_left - 1))
+        fi
+    done
 }
 
 function show_header()
